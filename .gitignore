@@ -1,0 +1,8 @@
+.DS_Store
+build/
+tests/*.jpg
+tests/*.jpeg
+tests/*.png
+tests/*.pdf
+*_自动裁剪.jpg
+*_自动裁剪.pdf
