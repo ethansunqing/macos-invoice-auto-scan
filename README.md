@@ -8,7 +8,7 @@ Right-click photographed invoices or documents in Finder to detect the paper, co
 
 - Finder 快速操作，一次点击完成处理
 - 使用 macOS 原生 Vision 自动识别票据和纸张四角
-- 两级自动矫正：先拉正斜拍和梯形透视，再根据文字行与表格线精细纠正残余歪斜
+- 两级自动矫正：先拉正斜拍和梯形透视，再保持纸张直立并根据文字行与表格线纠正残余歪斜
 - 压平阴影与偏色，提白纸张背景，增强文字和表格线
 - 保留红章、蓝章、签名等原始颜色
 - 同时生成高质量 JPEG 和单页 A4 PDF

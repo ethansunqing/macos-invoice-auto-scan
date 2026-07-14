@@ -79,13 +79,16 @@ final class InvoiceProcessor {
 
         let detection = try detectDocument(in: image)
         var corrected = image
+        var didCorrectPerspective = false
         if let rectangle = detection.rectangle,
            isUsable(rectangle, imageExtent: image.extent) {
             corrected = perspectiveCorrect(image, rectangle: rectangle)
+            corrected = trimLongDocumentFringe(corrected)
+            didCorrectPerspective = true
         }
 
         let deskewResult = options.deskew
-            ? deskewDocument(corrected)
+            ? deskewDocument(corrected, preserveVerticalEdges: didCorrectPerspective)
             : DeskewResult(image: corrected, angleDegrees: nil)
         corrected = deskewResult.image
 
@@ -202,11 +205,33 @@ final class InvoiceProcessor {
         return output
     }
 
+    /// Long receipts often leave a very narrow strip of the desk or phone UI
+    /// along the detected sides. Remove only that interpolation fringe; the
+    /// conservative inset stays well inside a receipt's normal blank margin.
+    private func trimLongDocumentFringe(_ image: CIImage) -> CIImage {
+        let extent = image.extent
+        guard extent.height / max(extent.width, 1) >= 2.5 else { return image }
+
+        let horizontalInset = min(max(extent.width * 0.018, 2), 16)
+        let crop = extent.insetBy(dx: horizontalInset, dy: 0).integral
+        guard crop.width > 32, crop.height > 32 else { return image }
+
+        var output = image.cropped(to: crop)
+        output = output.transformed(by: CGAffineTransform(
+            translationX: -crop.origin.x,
+            y: -crop.origin.y
+        ))
+        return output
+    }
+
     /// Corrects the small residual rotation that may remain after perspective
     /// correction. Invoices usually contain many text baselines and table
     /// rules, so a projection-profile search over horizontal edge pixels gives
     /// a stable angle without OCR or network services.
-    private func deskewDocument(_ image: CIImage) -> DeskewResult {
+    private func deskewDocument(
+        _ image: CIImage,
+        preserveVerticalEdges: Bool
+    ) -> DeskewResult {
         guard let angle = estimateDeskewAngle(image) else {
             return DeskewResult(image: image, angleDegrees: nil)
         }
@@ -215,14 +240,46 @@ final class InvoiceProcessor {
         // Cartesian coordinates, so the estimated value is already the
         // corrective (rather than observed) rotation angle.
         let radians = CGFloat(angle * .pi / 180)
-        let center = CGPoint(x: image.extent.midX, y: image.extent.midY)
-        let transform = CGAffineTransform(translationX: center.x, y: center.y)
-            .rotated(by: radians)
-            .translatedBy(x: -center.x, y: -center.y)
-        let rotated = image.transformed(by: transform)
-        let outputExtent = rotated.extent.integral
+        let transformed: CIImage
+        let finalExtent: CGRect
+        if preserveVerticalEdges {
+            // Perspective correction has already made the paper boundaries a
+            // rectangle. Rotating that rectangle again would leave the whole
+            // document diagonally placed on a white canvas. A vertical shear
+            // instead levels text/table lines while keeping both side edges
+            // vertical and preserving the document width.
+            let shear = tan(radians)
+            let transform = CGAffineTransform(
+                a: 1,
+                b: shear,
+                c: 0,
+                d: 1,
+                tx: 0,
+                ty: -shear * image.extent.midX
+            )
+            transformed = image.transformed(by: transform)
+            let verticalInset = abs(shear) * image.extent.width / 2
+            finalExtent = CGRect(
+                x: image.extent.minX,
+                y: image.extent.minY + verticalInset,
+                width: image.extent.width,
+                height: image.extent.height - verticalInset * 2
+            ).integral
+        } else {
+            let center = CGPoint(x: image.extent.midX, y: image.extent.midY)
+            let transform = CGAffineTransform(translationX: center.x, y: center.y)
+                .rotated(by: radians)
+                .translatedBy(x: -center.x, y: -center.y)
+            transformed = image.transformed(by: transform)
+            finalExtent = transformed.extent.integral
+        }
+
+        guard finalExtent.width > 32, finalExtent.height > 32 else {
+            return DeskewResult(image: image, angleDegrees: nil)
+        }
+        let outputExtent = finalExtent
         let white = CIImage(color: CIColor.white).cropped(to: outputExtent)
-        var output = rotated.composited(over: white).cropped(to: outputExtent)
+        var output = transformed.composited(over: white).cropped(to: outputExtent)
 
         if output.extent.origin != .zero {
             output = output.transformed(by: CGAffineTransform(
