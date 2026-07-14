@@ -15,6 +15,7 @@ enum OutputMode {
 struct Options {
     var mode: OutputMode = .both
     var enhance = true
+    var deskew = true
     var outputDirectory: URL?
     var inputs: [URL] = []
 }
@@ -42,6 +43,11 @@ enum CropError: LocalizedError {
 struct DetectionResult {
     let rectangle: VNRectangleObservation?
     let method: String
+}
+
+struct DeskewResult {
+    let image: CIImage
+    let angleDegrees: Double?
 }
 
 final class InvoiceProcessor {
@@ -77,6 +83,11 @@ final class InvoiceProcessor {
            isUsable(rectangle, imageExtent: image.extent) {
             corrected = perspectiveCorrect(image, rectangle: rectangle)
         }
+
+        let deskewResult = options.deskew
+            ? deskewDocument(corrected)
+            : DeskewResult(image: corrected, angleDegrees: nil)
+        corrected = deskewResult.image
 
         if options.enhance {
             corrected = enhanceDocument(corrected)
@@ -117,7 +128,12 @@ final class InvoiceProcessor {
         }
 
         let cropStatus = detection.rectangle == nil ? "未检测到纸张，保留整图" : detection.method
-        FileHandle.standardError.write(Data("INFO\t\(inputURL.path)\t\(cropStatus)\n".utf8))
+        let deskewStatus = deskewResult.angleDegrees.map {
+            String(format: "二次纠偏 %.2f°", $0)
+        } ?? (options.deskew ? "无需二次纠偏" : "已关闭二次纠偏")
+        FileHandle.standardError.write(Data(
+            "INFO\t\(inputURL.path)\t\(cropStatus)；\(deskewStatus)\n".utf8
+        ))
         return outputs
     }
 
@@ -184,6 +200,158 @@ final class InvoiceProcessor {
             ))
         }
         return output
+    }
+
+    /// Corrects the small residual rotation that may remain after perspective
+    /// correction. Invoices usually contain many text baselines and table
+    /// rules, so a projection-profile search over horizontal edge pixels gives
+    /// a stable angle without OCR or network services.
+    private func deskewDocument(_ image: CIImage) -> DeskewResult {
+        guard let angle = estimateDeskewAngle(image) else {
+            return DeskewResult(image: image, angleDegrees: nil)
+        }
+
+        // Bitmap rows run in the opposite vertical direction to Core Image's
+        // Cartesian coordinates, so the estimated value is already the
+        // corrective (rather than observed) rotation angle.
+        let radians = CGFloat(angle * .pi / 180)
+        let center = CGPoint(x: image.extent.midX, y: image.extent.midY)
+        let transform = CGAffineTransform(translationX: center.x, y: center.y)
+            .rotated(by: radians)
+            .translatedBy(x: -center.x, y: -center.y)
+        let rotated = image.transformed(by: transform)
+        let outputExtent = rotated.extent.integral
+        let white = CIImage(color: CIColor.white).cropped(to: outputExtent)
+        var output = rotated.composited(over: white).cropped(to: outputExtent)
+
+        if output.extent.origin != .zero {
+            output = output.transformed(by: CGAffineTransform(
+                translationX: -output.extent.origin.x,
+                y: -output.extent.origin.y
+            ))
+        }
+        return DeskewResult(image: output, angleDegrees: angle)
+    }
+
+    private func estimateDeskewAngle(_ image: CIImage) -> Double? {
+        let longestSide = max(image.extent.width, image.extent.height)
+        guard longestSide > 64 else { return nil }
+
+        let scale = min(1, 1200 / longestSide)
+        let preview = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let previewExtent = preview.extent.integral
+        guard let cgImage = context.createCGImage(
+            preview,
+            from: previewExtent,
+            format: .RGBA8,
+            colorSpace: colorSpace
+        ) else { return nil }
+
+        let width = cgImage.width
+        let height = cgImage.height
+        guard width >= 64, height >= 64 else { return nil }
+
+        var gray = [UInt8](repeating: 0, count: width * height)
+        let rendered = gray.withUnsafeMutableBytes { buffer -> Bool in
+            guard let baseAddress = buffer.baseAddress,
+                  let graySpace = CGColorSpace(name: CGColorSpace.linearGray),
+                  let bitmap = CGContext(
+                    data: baseAddress,
+                    width: width,
+                    height: height,
+                    bitsPerComponent: 8,
+                    bytesPerRow: width,
+                    space: graySpace,
+                    bitmapInfo: CGImageAlphaInfo.none.rawValue
+                  ) else { return false }
+            bitmap.interpolationQuality = .medium
+            bitmap.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard rendered else { return nil }
+
+        struct EdgePoint {
+            let x: Double
+            let y: Double
+            let weight: Double
+        }
+
+        // Keep edges whose vertical gradient dominates. These are primarily
+        // horizontal table rules and the upper/lower edges of text strokes.
+        let stride = max(1, min(width, height) / 700)
+        var points: [EdgePoint] = []
+        points.reserveCapacity(60_000)
+        for y in Swift.stride(from: 2, to: height - 2, by: stride) {
+            for x in Swift.stride(from: 2, to: width - 2, by: stride) {
+                let vertical = abs(Int(gray[(y + 1) * width + x]) - Int(gray[(y - 1) * width + x]))
+                guard vertical >= 20 else { continue }
+                let horizontal = abs(Int(gray[y * width + x + 1]) - Int(gray[y * width + x - 1]))
+                guard Double(vertical) >= Double(horizontal) * 0.85 else { continue }
+                points.append(EdgePoint(
+                    x: Double(x) - Double(width) / 2,
+                    y: Double(y) - Double(height) / 2,
+                    weight: Double(min(vertical, 96)) / 96
+                ))
+            }
+        }
+
+        // Uniform thinning keeps the search fast without favouring one area.
+        if points.count > 90_000 {
+            let step = Double(points.count) / 90_000
+            points = (0..<90_000).map { points[Int(Double($0) * step)] }
+        }
+        guard points.count >= 900 else { return nil }
+
+        let maximumAngle = 7.0
+        let bucketPadding = Int(ceil(tan(maximumAngle * .pi / 180) * Double(width) / 2)) + 4
+        let bucketCount = height + bucketPadding * 2 + 8
+
+        func score(_ angle: Double) -> Double {
+            let slope = tan(angle * .pi / 180)
+            var buckets = [Float](repeating: 0, count: bucketCount)
+            for point in points {
+                let projected = point.y - slope * point.x
+                let bucket = Int(projected.rounded()) + height / 2 + bucketPadding + 4
+                if bucket >= 0 && bucket < bucketCount {
+                    buckets[bucket] += Float(point.weight)
+                }
+            }
+            // Squaring rewards angles that concentrate many edge pixels onto
+            // the same rows, which is exactly what happens when lines are level.
+            return buckets.reduce(0) { $0 + Double($1 * $1) }
+        }
+
+        var coarse: [(angle: Double, score: Double)] = []
+        var angle = -maximumAngle
+        while angle <= maximumAngle + 0.0001 {
+            coarse.append((angle, score(angle)))
+            angle += 0.10
+        }
+        guard let coarseBest = coarse.max(by: { $0.score < $1.score }) else { return nil }
+
+        var best = coarseBest
+        angle = coarseBest.angle - 0.10
+        while angle <= coarseBest.angle + 0.1001 {
+            let candidate = (angle, score(angle))
+            if candidate.1 > best.score {
+                best = candidate
+            }
+            angle += 0.02
+        }
+
+        let zeroScore = score(0)
+        let sortedScores = coarse.map(\.score).sorted()
+        let medianScore = sortedScores[sortedScores.count / 2]
+
+        // A meaningful correction must be visible, confidently better than
+        // zero rotation, and not pinned to the edge of the search interval.
+        guard abs(best.angle) >= 0.20,
+              abs(best.angle) <= maximumAngle - 0.08,
+              best.score >= zeroScore * 1.025,
+              best.score >= medianScore * 1.08 else {
+            return nil
+        }
+        return best.angle
     }
 
     private func enhanceDocument(_ image: CIImage) -> CIImage {
@@ -306,12 +474,14 @@ func parseOptions() -> Options {
             options.mode = .both
         case "--no-enhance":
             options.enhance = false
+        case "--no-deskew":
+            options.deskew = false
         case "--output-dir":
             if !arguments.isEmpty {
                 options.outputDirectory = URL(fileURLWithPath: arguments.removeFirst(), isDirectory: true)
             }
         case "--help", "-h":
-            print("用法: invoice-autocrop [--both|--image-only|--pdf-only] [--no-enhance] 图片...")
+            print("用法: invoice-autocrop [--both|--image-only|--pdf-only] [--no-enhance] [--no-deskew] 图片...")
             exit(0)
         default:
             options.inputs.append(URL(fileURLWithPath: value))

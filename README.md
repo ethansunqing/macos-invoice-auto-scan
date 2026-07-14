@@ -1,14 +1,14 @@
 # macOS Invoice Auto Scan
 
-在 Finder 中右键一张或多张票据照片，自动完成文档边缘识别、透视矫正和彩色扫描增强，并在原图旁生成 JPEG 与 PDF。
+在 Finder 中右键一张或多张票据照片，自动完成文档边缘识别、透视矫正、残余歪斜纠正和彩色扫描增强，并在原图旁生成 JPEG 与 PDF。
 
-Right-click photographed invoices or documents in Finder to detect the paper, correct perspective, enhance them in a color scan style, and export JPEG and PDF files locally.
+Right-click photographed invoices or documents in Finder to detect the paper, correct perspective and residual skew, enhance them in a color scan style, and export JPEG and PDF files locally.
 
 ## 功能
 
 - Finder 快速操作，一次点击完成处理
 - 使用 macOS 原生 Vision 自动识别票据和纸张四角
-- 自动矫正斜拍、梯形透视和照片方向
+- 两级自动矫正：先拉正斜拍和梯形透视，再根据文字行与表格线精细纠正残余歪斜
 - 压平阴影与偏色，提白纸张背景，增强文字和表格线
 - 保留红章、蓝章、签名等原始颜色
 - 同时生成高质量 JPEG 和单页 A4 PDF
@@ -69,7 +69,8 @@ cd macos-invoice-auto-scan
 --both          同时输出 JPEG 和 PDF（默认）
 --image-only    仅输出 JPEG
 --pdf-only      仅输出 PDF
---no-enhance    不做彩色扫描增强，仅裁边和透视矫正
+--no-enhance    不做彩色扫描增强，保留裁边和两级纠偏
+--no-deskew     关闭文字行/表格线二次纠偏
 --output-dir    指定输出目录
 ```
 
@@ -83,9 +84,10 @@ cd macos-invoice-auto-scan
 
 1. `VNDetectDocumentSegmentationRequest` 检测文档边缘。
 2. `CIPerspectiveCorrection` 完成透视矫正。
-3. 大范围背景估计与局部光照归一化消除拍照阴影和偏色。
-4. 保留颜色的对比度、降噪和锐化处理产生扫描效果。
-5. ImageIO 与 Core Graphics 输出 JPEG 和 A4 PDF。
+3. 分析文字基线和表格横线的投影集中度，在可靠范围内自动完成小角度二次纠偏。
+4. 大范围背景估计与局部光照归一化消除拍照阴影和偏色。
+5. 保留颜色的对比度、降噪和锐化处理产生扫描效果。
+6. ImageIO 与 Core Graphics 输出 JPEG 和 A4 PDF。
 
 检测不到可靠纸张边缘时，程序会保留整张图片，避免错误裁切。
 
